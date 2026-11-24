@@ -37,11 +37,39 @@ interface ClinicCredential {
 
 interface StoreFileShape {
   adminCredential: ClinicCredential | null;
+  signingSecret?: string;
+  revokedJtis?: string[];
   patients: StoredPatientRecord[];
 }
 
-const DATA_DIR = path.resolve(process.cwd(), 'data');
-const STORE_PATH = path.resolve(DATA_DIR, 'clinic-store.json');
+const STORE_KEY = 'dra_gabriella_clinic_store_v1';
+
+function getStorePath(): string {
+  if (process.env.VERCEL === '1' || process.env.AWS_LAMBDA_FUNCTION_NAME) {
+    return path.resolve('/tmp', 'clinic-store.json');
+  }
+  return path.resolve(process.cwd(), 'data', 'clinic-store.json');
+}
+
+function getKvConfig(): { url: string; token: string } | null {
+  const url =
+    process.env.KV_REST_API_URL?.trim() ||
+    process.env.UPSTASH_REDIS_REST_URL?.trim();
+  const token =
+    process.env.KV_REST_API_TOKEN?.trim() ||
+    process.env.UPSTASH_REDIS_REST_TOKEN?.trim();
+
+  if (!url || !token) return null;
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+      return null;
+    }
+    return { url: url.replace(/\/+$/, ''), token };
+  } catch {
+    return null;
+  }
+}
 
 function hashToken(rawToken: string): string {
   return crypto.createHash('sha256').update(rawToken).digest('hex');
@@ -69,6 +97,8 @@ function toPublicRecord(record: StoredPatientRecord): PublicPatientRecord {
 function createInitialStore(): StoreFileShape {
   return {
     adminCredential: null,
+    signingSecret: crypto.randomBytes(32).toString('hex'),
+    revokedJtis: [],
     patients: [
       {
         id: 'pat-seed-1',
@@ -144,32 +174,87 @@ function createInitialStore(): StoreFileShape {
   };
 }
 
-let writeQueue: Promise<void> = Promise.resolve();
-
-function ensureStoreLoaded(): StoreFileShape {
-  if (!fs.existsSync(DATA_DIR)) {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-  }
-  if (!fs.existsSync(STORE_PATH)) {
-    const initial = createInitialStore();
-    fs.writeFileSync(STORE_PATH, JSON.stringify(initial, null, 2), 'utf8');
-    return initial;
-  }
-  const raw = fs.readFileSync(STORE_PATH, 'utf8');
-  const parsed = JSON.parse(raw) as StoreFileShape;
+function normalizeStore(parsed: Partial<StoreFileShape> | null): StoreFileShape {
+  if (!parsed) return createInitialStore();
   return {
     adminCredential: parsed.adminCredential ?? null,
+    signingSecret:
+      typeof parsed.signingSecret === 'string' && parsed.signingSecret
+        ? parsed.signingSecret
+        : crypto.randomBytes(32).toString('hex'),
+    revokedJtis: Array.isArray(parsed.revokedJtis)
+      ? parsed.revokedJtis.slice(-200)
+      : [],
     patients: Array.isArray(parsed.patients) ? parsed.patients : [],
   };
 }
 
+async function loadStore(): Promise<StoreFileShape> {
+  const kv = getKvConfig();
+  if (kv) {
+    const res = await fetch(`${kv.url}/get/${encodeURIComponent(STORE_KEY)}`, {
+      headers: { Authorization: `Bearer ${kv.token}` },
+    });
+    if (!res.ok) {
+      throw new Error('Falha ao consultar armazenamento remoto.');
+    }
+    const payload = (await res.json()) as { result?: string | null };
+    if (!payload.result) {
+      const initial = createInitialStore();
+      await saveStore(initial);
+      return initial;
+    }
+    return normalizeStore(JSON.parse(payload.result) as Partial<StoreFileShape>);
+  }
+
+  const storePath = getStorePath();
+  const dir = path.dirname(storePath);
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+  if (!fs.existsSync(storePath)) {
+    const initial = createInitialStore();
+    fs.writeFileSync(storePath, JSON.stringify(initial, null, 2), 'utf8');
+    return initial;
+  }
+  const raw = fs.readFileSync(storePath, 'utf8');
+  return normalizeStore(JSON.parse(raw) as Partial<StoreFileShape>);
+}
+
+async function saveStore(data: StoreFileShape): Promise<void> {
+  const kv = getKvConfig();
+  if (kv) {
+    const res = await fetch(kv.url, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${kv.token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(['SET', STORE_KEY, JSON.stringify(data)]),
+    });
+    if (!res.ok) {
+      throw new Error('Falha ao salvar dados no armazenamento remoto.');
+    }
+    return;
+  }
+
+  const storePath = getStorePath();
+  const dir = path.dirname(storePath);
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+  const tmpPath = `${storePath}.${process.pid}.${Date.now()}.tmp`;
+  fs.writeFileSync(tmpPath, JSON.stringify(data, null, 2), 'utf8');
+  fs.renameSync(tmpPath, storePath);
+}
+
+let writeQueue: Promise<void> = Promise.resolve();
+
 function enqueueMutation<T>(mutator: (data: StoreFileShape) => T): Promise<T> {
-  const next = writeQueue.then(() => {
-    const current = ensureStoreLoaded();
+  const next = writeQueue.then(async () => {
+    const current = await loadStore();
     const result = mutator(current);
-    const tmpPath = `${STORE_PATH}.${process.pid}.${Date.now()}.tmp`;
-    fs.writeFileSync(tmpPath, JSON.stringify(current, null, 2), 'utf8');
-    fs.renameSync(tmpPath, STORE_PATH);
+    await saveStore(current);
     return result;
   });
   writeQueue = next.then(
@@ -179,15 +264,51 @@ function enqueueMutation<T>(mutator: (data: StoreFileShape) => T): Promise<T> {
   return next;
 }
 
-export function getAuthStatus(): { configured: boolean; envConfigured: boolean } {
+export async function getSessionSecret(): Promise<string> {
+  const envSecret = process.env.SESSION_SECRET?.trim();
+  if (envSecret) return envSecret;
+
+  const data = await loadStore();
+  if (data.signingSecret) return data.signingSecret;
+
+  return enqueueMutation((draft) => {
+    if (!draft.signingSecret) {
+      draft.signingSecret = crypto.randomBytes(32).toString('hex');
+    }
+    return draft.signingSecret;
+  });
+}
+
+export async function revokeSessionJti(jti: string): Promise<void> {
+  await enqueueMutation((data) => {
+    const list = data.revokedJtis ?? [];
+    if (!list.includes(jti)) {
+      list.push(jti);
+    }
+    data.revokedJtis = list.slice(-200);
+  });
+}
+
+export async function isSessionJtiRevoked(jti: string): Promise<boolean> {
+  const data = await loadStore();
+  return Boolean(data.revokedJtis?.includes(jti));
+}
+
+export async function getAuthStatus(): Promise<{
+  configured: boolean;
+  envConfigured: boolean;
+  persistentDb: boolean;
+}> {
   const envPass = process.env.CLINIC_PASSCODE?.trim();
+  const persistentDb = Boolean(getKvConfig()) || process.env.VERCEL !== '1';
   if (envPass) {
-    return { configured: true, envConfigured: true };
+    return { configured: true, envConfigured: true, persistentDb };
   }
-  const data = ensureStoreLoaded();
+  const data = await loadStore();
   return {
     configured: Boolean(data.adminCredential),
     envConfigured: false,
+    persistentDb,
   };
 }
 
@@ -207,7 +328,7 @@ export async function claimFirstRunPasscode(passcode: string): Promise<boolean> 
   });
 }
 
-export function verifyClinicPasscode(passcode: string): boolean {
+export async function verifyClinicPasscode(passcode: string): Promise<boolean> {
   const candidate = passcode.trim();
   if (!candidate) return false;
 
@@ -218,7 +339,7 @@ export function verifyClinicPasscode(passcode: string): boolean {
     return crypto.timingSafeEqual(a, b);
   }
 
-  const data = ensureStoreLoaded();
+  const data = await loadStore();
   if (!data.adminCredential) {
     return false;
   }
@@ -288,12 +409,12 @@ export async function createPatientConversation(input: {
   };
 }
 
-export function getPatientIfAuthorized(
+export async function getPatientIfAuthorized(
   patientId: string,
   rawPatientToken: string | null,
   isClinicAdmin: boolean
-): PublicPatientRecord | null {
-  const data = ensureStoreLoaded();
+): Promise<PublicPatientRecord | null> {
+  const data = await loadStore();
   const found = data.patients.find((p) => p.id === patientId);
   if (!found) return null;
 
@@ -344,8 +465,8 @@ export async function appendPatientMessage(
   });
 }
 
-export function listAllPatientsForClinic(): PublicPatientRecord[] {
-  const data = ensureStoreLoaded();
+export async function listAllPatientsForClinic(): Promise<PublicPatientRecord[]> {
+  const data = await loadStore();
   return data.patients.map(toPublicRecord);
 }
 
